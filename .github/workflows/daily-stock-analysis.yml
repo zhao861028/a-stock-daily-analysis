@@ -2,7 +2,7 @@ name: A股大盘每日分析推送
 
 on:
   schedule:
-    - cron: '30 0 * * 1-5'
+    - cron: '0 0 * * 1-5'
   workflow_dispatch:
 
 jobs:
