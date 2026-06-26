@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -65,7 +63,10 @@ def is_trading_day():
 
 def fetch_text(url, headers=None, timeout=15, encoding="utf-8"):
     try:
-        req = urllib.request.Request(url, headers=headers or {})
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, headers=h)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read()
             try:
@@ -77,7 +78,10 @@ def fetch_text(url, headers=None, timeout=15, encoding="utf-8"):
 
 def fetch_json(url, headers=None, timeout=15):
     try:
-        req = urllib.request.Request(url, headers=headers or {})
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"}
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, headers=h)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8", errors="ignore"))
     except Exception as e:
@@ -94,6 +98,22 @@ def safe_float(v, default=0.0):
         return float(v)
     except (ValueError, TypeError):
         return default
+
+def retry_call(func, args=None, kwargs=None, max_retries=2, delay=3):
+    """带重试的函数调用，针对国内网站不稳定；全部失败时返回 None"""
+    args = args or []
+    kwargs = kwargs or {}
+    last_err = None
+    for attempt in range(1 + max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                import time
+                time.sleep(delay)
+    print(f"[WARN] {func.__name__} 重试{max_retries}次后仍失败: {last_err}")
+    return None
 
 # ===================== 技术指标计算 =====================
 def calc_ema(values, period):
@@ -224,7 +244,16 @@ def get_a_stock_index():
     return result
 
 def get_index_kline(secid, lmt=60):
-    """获取指数K线（用于计算技术指标）"""
+    """获取指数K线（用于计算技术指标），东方财富失败后回退到腾讯"""
+    # 东方财富 secid -> 腾讯 symbol 映射
+    secid_map = {
+        "1.000001": "sh000001",
+        "0.399001": "sz399001",
+        "1.000300": "sh000300",
+    }
+    tencent_symbol = secid_map.get(secid, secid)
+
+    # 1. 先尝试东方财富
     url = (
         f"http://push2his.eastmoney.com/api/qt/stock/kline/get"
         f"?secid={secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13"
@@ -232,20 +261,44 @@ def get_index_kline(secid, lmt=60):
         f"&klt=101&fqt=0&end=20500101&lmt={lmt}"
     )
     data = fetch_json(url)
-    if isinstance(data, str) or "data" not in data or data["data"] is None:
-        return []
-    klines = data["data"].get("klines", [])
-    parsed = []
-    for k in klines:
-        parts = k.split(",")
-        if len(parts) >= 11:
-            parsed.append({
-                "date": parts[0], "open": float(parts[1]),
-                "close": float(parts[2]), "high": float(parts[3]),
-                "low": float(parts[4]), "volume": int(parts[5]),
-                "amount": float(parts[6]),
-            })
-    return parsed
+    if isinstance(data, dict) and "data" in data and data["data"] is not None:
+        klines = data["data"].get("klines", [])
+        parsed = []
+        for k in klines:
+            parts = k.split(",")
+            if len(parts) >= 11:
+                parsed.append({
+                    "date": parts[0], "open": float(parts[1]),
+                    "close": float(parts[2]), "high": float(parts[3]),
+                    "low": float(parts[4]), "volume": int(parts[5]),
+                    "amount": float(parts[6]),
+                })
+        if len(parsed) >= 30:
+            return parsed
+
+    # 2. 东方财富失败后回退腾讯
+    print(f"[WARN] 东方财富K线 {secid} 获取不足，尝试腾讯数据源...")
+    tencent_url = (
+        f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+        f"?param={tencent_symbol},day,,,{lmt},qfq"
+    )
+    data2 = fetch_json(tencent_url)
+    if isinstance(data2, dict) and "data" in data2:
+        day_data = data2["data"].get(tencent_symbol, {}).get("day", [])
+        parsed2 = []
+        for k in day_data:
+            if len(k) >= 6:
+                # 腾讯格式: [date, open, close, high, low, volume]
+                parsed2.append({
+                    "date": k[0], "open": float(k[1]),
+                    "close": float(k[2]), "high": float(k[3]),
+                    "low": float(k[4]), "volume": int(float(k[5])),
+                    "amount": 0.0,
+                })
+        if len(parsed2) >= 30:
+            return parsed2
+
+    raise Exception(f"无法获取K线数据: {secid}")
 
 def get_advance_decline():
     """获取涨跌家数"""
@@ -330,13 +383,16 @@ def get_margin_balance():
     text = fetch_text(url, headers={"User-Agent": "Mozilla/5.0"}, encoding="gbk")
     if "ERROR" not in text:
         # 从 dataDay JS 数组提取（取最新日期）
+        # 格式: dataDay = [[["2026-04-24",27127.86,...], ["2026-04-27",27285.30,...], ...]]
         matches = re.findall(r'"(\d{4}-\d{2}-\d{2})",([\d.]+)', text)
         if matches:
+            # 找到最新日期的那条
             with_date = [(m[0], safe_float(m[1])) for m in matches
-                         if safe_float(m[1]) > 10000]
+                         if safe_float(m[1]) > 10000]  # 只取大于10000的（过滤小数值）
             if with_date:
                 with_date.sort(key=lambda x: x[0], reverse=True)
                 return with_date[0][1]
+        # 降级: 从表格最后一行获取总和
         rows = re.findall(r'<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>', text)
         if rows:
             return safe_float(rows[-1][2])
@@ -526,7 +582,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
     # ===== 5. 资金面 =====
     lines.append("【💰 资金面】")
     if northbound:
-        total = northbound.get("total_net", 0) / 1e4
+        total = northbound.get("total_net", 0) / 1e4  # 转亿元
         if total != 0:
             sign = "+" if total > 0 else ""
             lines.append(f"  北向资金(沪深港通): {sign}{total:.2f}亿 {'🔴' if total > 0 else '🟢'}")
@@ -538,6 +594,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
 
     if margin_bal:
         lines.append(f"  两融余额: {margin_bal:.2f}亿")
+        # 判断两融趋势
         if margin_bal > 29000:
             lines.append(f"    两融余额处于较高水平，市场情绪活跃")
             all_signals.append(("两融", 1))
@@ -552,6 +609,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
     if "sh000001" in index_data:
         d = index_data["sh000001"]
         lines.append(f"  成交额: {d['turnover']:.1f}亿")
+        prev_vol = None
         if klines_sh and len(klines_sh) >= 2:
             prev_vol = klines_sh[-2]["volume"]
             today_vol = klines_sh[-1]["volume"]
@@ -587,6 +645,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
             sign = "+" if item["change_pct"] >= 0 else ""
             lines.append(f"  {item['name']}: {item['price']:.2f} ({sign}{item['change_pct']:.2f}%)")
 
+    # 外围影响评分
     nasdaq = global_data.get("NASDAQ", {}).get("change_pct", 0)
     if nasdaq:
         all_signals.append(("美股", 1 if nasdaq > 0.5 else (-1 if nasdaq < -0.5 else 0)))
@@ -600,6 +659,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
                  f"MLF: {MACRO_DATA['MLF']} ({MACRO_DATA['MLF_month']})")
     lines.append(f"  M1: {MACRO_DATA['M1']} ({MACRO_DATA['M1_month']})  "
                  f"M2: {MACRO_DATA['M2']} ({MACRO_DATA['M2_month']})")
+    # 宏观判断
     if safe_float(MACRO_DATA.get("PMI", "49")) >= 50:
         all_signals.append(("PMI", 1))
     else:
@@ -614,12 +674,13 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
     max_score = 0
     for name, score in all_signals:
         total_score += score
-        max_score += 2
+        max_score += 2  # 每个信号满分2分
     if max_score > 0:
         pct = int((total_score + max_score) / (2 * max_score) * 100)
     else:
         pct = 50
 
+    # 多空判定
     if total_score >= 4:
         verdict = "偏多 📈"
         stars = "★★★★★" if total_score >= 6 else "★★★★☆"
@@ -652,6 +713,7 @@ def analyze_market(index_data, klines_sh, klines_sz, klines_300, global_data, fu
         else:
             lines.append(f"    {emoji} {name}: 中性 (0)")
 
+    # 成交量均线
     if klines_sh and len(klines_sh) >= 10:
         vols = [k["volume"] for k in klines_sh[-10:]]
         vol_ma5 = sum(vols[-5:]) / 5
@@ -689,18 +751,18 @@ def main(force=False):
         return
 
     print(f"[{today_str()}] ===== A股大盘深度分析 v2.0 =====")
-    print("正在获取数据...")
+    print("正在获取数据（网络不稳定会自动重试）...")
 
-    index_data = get_a_stock_index()
-    klines_sh = get_index_kline("1.000001", 60)
-    klines_sz = get_index_kline("0.399001", 60)
-    klines_300 = get_index_kline("1.000300", 60)
-    global_data = get_global_markets()
-    futures = get_us_futures()
-    adv_dec = get_advance_decline()
-    sector_inflows, sector_gainers = get_sector_flow(5)
-    northbound = get_northbound_flow()
-    margin_bal = get_margin_balance()
+    index_data = retry_call(get_a_stock_index)
+    klines_sh = retry_call(get_index_kline, args=("1.000001", 60))
+    klines_sz = retry_call(get_index_kline, args=("0.399001", 60))
+    klines_300 = retry_call(get_index_kline, args=("1.000300", 60))
+    global_data = retry_call(get_global_markets)
+    futures = retry_call(get_us_futures)
+    adv_dec = retry_call(get_advance_decline)
+    sector_inflows, sector_gainers = retry_call(get_sector_flow, args=(5,)) or ([], [])
+    northbound = retry_call(get_northbound_flow)
+    margin_bal = retry_call(get_margin_balance)
 
     print("数据获取完成，开始分析...")
 
@@ -713,9 +775,11 @@ def main(force=False):
 
     print(report)
 
+    # 保存报告
     with open("report.txt", "w", encoding="utf-8") as f:
         f.write(report)
 
+    # PushPlus 推送
     title = f"A股大盘分析 {today_str()} {verdict}"
     push_result = push_to_wechat(title, report)
     print(f"\nPushPlus 推送结果: {push_result}")
